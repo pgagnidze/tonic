@@ -11,16 +11,11 @@ Answer yes/no questions by playing your instrument. Major scale means yes, minor
 
 </div>
 
-## Features
-
-- **Scale detection**: YIN pitch tracking with pitch-class histograms; distinguishes minor from major blues or pentatonic scales in any key.
-- **Claude Code integration**: a PermissionRequest hook lets a lick approve or deny permission dialogs; unclear takes fall back to the keyboard.
-- **Shell gate**: `tonic confirm && git push` for confirmations you cannot fat-finger; exit codes 0/1/2, fail closed; works as a git pre-push hook.
-- **Zero dependencies**: a single Lua file with a hand-rolled FFT; runs on LuaJIT or Lua 5.4; any monophonic instrument works, including humming.
-
 ## How It Works
 
-tonic records a few seconds of audio, tracks one fundamental frequency per frame (YIN with FFT autocorrelation), and tallies which notes you played. Minor and major scales built on the same root share notes, so the key is fixed up front and only the notes that separate the two scales are scored. In A blues, D, D# and G vote no; B, C# and F# vote yes; the root, the flat third, and the fifth are neutral.
+tonic records a few seconds of audio, tracks one fundamental frequency per frame (YIN with FFT autocorrelation), and tallies which notes you played. Minor and major scales built on the same root share notes, so the key is fixed up front and only the notes that separate the two scales are scored. In A blues, D, D# and G vote no. B, C# and F# vote yes. The root, the flat third and the fifth are neutral.
+
+Everything lives in a single Lua file with a hand-rolled FFT, no libraries required. It runs on LuaJIT or Lua 5.4, and any monophonic instrument works, humming included.
 
 Silence, ambient hum, or a take with fewer than three distinct notes returns UNCLEAR instead of a verdict, so a misfire never approves anything.
 
@@ -54,7 +49,7 @@ One audio capture tool. tonic tries them in order:
 | `arecord` | Linux (ALSA) | alsa-utils |
 | `rec` | macOS or Linux | `brew install sox` / sox package |
 
-Optional: `pactl` (Linux) for `mic-check`; macOS uses the built-in `system_profiler`.
+Optional: `pactl` (Linux) for `mic-check`. macOS uses the built-in `system_profiler`.
 
 ## Usage
 
@@ -86,7 +81,7 @@ tonic mic-check              find the input source for your instrument
 
 ## Claude Code Hook
 
-Add to `.claude/settings.local.json` in a project (fires only when a permission dialog would appear; needs default permission mode, since auto mode answers prompts before hooks see them):
+Add to `.claude/settings.local.json` in a project, or to `~/.claude/settings.json` for every session. The hook fires only when a permission dialog would appear, and it needs default permission mode, since auto mode answers prompts before hooks see them. Use `"Bash"` to gate shell commands, or `"Bash|Edit|Write"` to gate file changes too:
 
 ```json
 {
