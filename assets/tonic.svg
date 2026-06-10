@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Pixel tuning fork: the tonic is the reference pitch. -->
+  <!-- Left prong dark (minor = no), right prong light (major = yes), -->
+  <!-- both resolve into one stem. Navy palette from lnko. -->
+
+  <!-- Left prong (minor side) -->
+  <rect x="12" y="8" width="8" height="8" fill="#000080"/>
+  <rect x="12" y="16" width="8" height="8" fill="#000080"/>
+  <rect x="12" y="24" width="8" height="8" fill="#1e3a8a"/>
+
+  <!-- Right prong (major side) -->
+  <rect x="44" y="8" width="8" height="8" fill="#60a5fa"/>
+  <rect x="44" y="16" width="8" height="8" fill="#3b82f6"/>
+  <rect x="44" y="24" width="8" height="8" fill="#3b82f6"/>
+
+  <!-- Joint -->
+  <rect x="12" y="32" width="8" height="8" fill="#1e3a8a"/>
+  <rect x="20" y="32" width="8" height="8" fill="#1e3a8a"/>
+  <rect x="28" y="32" width="8" height="8" fill="#3b82f6"/>
+  <rect x="36" y="32" width="8" height="8" fill="#3b82f6"/>
+  <rect x="44" y="32" width="8" height="8" fill="#3b82f6"/>
+
+  <!-- Stem, brightening toward the reference pitch -->
+  <rect x="28" y="40" width="8" height="8" fill="#3b82f6"/>
+  <rect x="28" y="48" width="8" height="8" fill="#60a5fa"/>
+</svg>

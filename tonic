@@ -1,0 +1,726 @@
+#!/usr/bin/env luajit
+-- tonic: answer yes/no questions by playing scales (major = YES, minor = NO).
+-- Subcommands: decide, confirm, hook, mic-check. See `tonic --help`.
+
+local has_ffi, ffi = pcall(require, "ffi")
+
+local RATE = 44100
+local FRAME = 2048
+local HOP = 1024
+local FMIN = 70.0
+local FMAX = 1200.0
+local YIN_THRESHOLD = 0.15
+local MAX_APERIODICITY = 0.5
+local LEVEL_FLOOR = 0.005
+local MIN_VOICED_FRAMES = 15
+local MIN_DISTINCT_NOTES = 3
+local SILENCE_RMS = 0.002
+local LOG2 = math.log(2)
+
+local NOTE_TO_PC = {
+    C = 0,
+    ["C#"] = 1,
+    DB = 1,
+    D = 2,
+    ["D#"] = 3,
+    EB = 3,
+    E = 4,
+    F = 5,
+    ["F#"] = 6,
+    GB = 6,
+    G = 7,
+    ["G#"] = 8,
+    AB = 8,
+    A = 9,
+    ["A#"] = 10,
+    BB = 10,
+    B = 11,
+}
+local PC_TO_NOTE = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" }
+
+local SCALES = {
+    blues = { minor = { 0, 3, 5, 6, 7, 10 }, major = { 0, 2, 3, 4, 7, 9 } },
+    pentatonic = { minor = { 0, 3, 5, 7, 10 }, major = { 0, 2, 4, 7, 9 } },
+}
+
+local USAGE = [[
+tonic: answer yes/no questions by playing scales (major = YES, minor = NO)
+
+Usage:
+    tonic decide [options]       print the verdict
+    tonic confirm [options]      exit 0 = YES, 1 = NO, 2 = UNCLEAR
+    tonic hook [options]         Claude Code PermissionRequest hook
+    tonic mic-check              find the input source for your instrument
+
+Options:
+    --key NOTE             root of the agreed key (default: A)
+    --scale NAME           blues or pentatonic (default: blues)
+    --duration SECONDS     listening window (default: 4)
+    --countdown SECONDS    get-ready countdown before listening (default: 0)
+    --source NAME          PipeWire/Pulse source (default: $TONIC_SOURCE)
+    --min-confidence X     below this the verdict is UNCLEAR (default: 0)
+    --input FILE           analyze raw s16le samples from FILE instead of recording
+]]
+
+local function die(message)
+    error("tonic: " .. message, 0)
+end
+
+local function binary_exists(name)
+    local ok = os.execute("command -v " .. name .. " >/dev/null 2>&1")
+    return ok == true or ok == 0
+end
+
+local function shell_quote(text)
+    return "'" .. text:gsub("'", "'\\''") .. "'"
+end
+
+local function shellout(command)
+    local handle = io.popen(command .. " 2>/dev/null")
+    if not handle then
+        return ""
+    end
+    local stdout = handle:read("*a")
+    handle:close()
+    return stdout or ""
+end
+
+local function json_escape(text)
+    return (text:gsub('[\\"]', "\\%0"):gsub("\n", "\\n"))
+end
+
+-- audio capture --
+
+local function decode_samples(data)
+    local count = math.floor(#data / 2)
+    local samples = {}
+    if has_ffi then
+        local pointer = ffi.cast("const int16_t *", data)
+        for i = 1, count do
+            samples[i] = pointer[i - 1] / 32768.0
+        end
+    else
+        for i = 1, count do
+            samples[i] = string.unpack("<i2", data, (i - 1) * 2 + 1) / 32768.0
+        end
+    end
+    return samples
+end
+
+local function read_exactly(handle, needed)
+    local chunks = {}
+    local got = 0
+    while got < needed do
+        local chunk = handle:read(needed - got)
+        if not chunk or #chunk == 0 then
+            break
+        end
+        chunks[#chunks + 1] = chunk
+        got = got + #chunk
+    end
+    return table.concat(chunks)
+end
+
+local function capture_command(duration, source)
+    if binary_exists("parec") then
+        local command = string.format("parec --format=s16le --rate=%d --channels=1", RATE)
+        if source then
+            command = command .. " --device=" .. shell_quote(source)
+        end
+        return command
+    end
+    if binary_exists("pw-record") then
+        local command = string.format("pw-record --format=s16 --rate=%d --channels=1", RATE)
+        if source then
+            command = command .. " --target=" .. shell_quote(source)
+        end
+        return command .. " -"
+    end
+    if binary_exists("arecord") then
+        local command =
+            string.format("arecord -q -t raw -f S16_LE -r %d -c 1 -d %d", RATE, math.ceil(duration))
+        if source then
+            command = command .. " -D " .. shell_quote(source)
+        end
+        return command
+    end
+    if binary_exists("rec") then
+        local command =
+            string.format("rec -q -t raw -r %d -e signed -b 16 -c 1 - trim 0 %g", RATE, duration)
+        if source then
+            command = "AUDIODEV=" .. shell_quote(source) .. " " .. command
+        end
+        return command
+    end
+    return nil
+end
+
+local function capture_audio(duration, source)
+    local command = capture_command(duration, source)
+    if not command then
+        die("no capture tool found (need parec, pw-record, arecord, or sox rec)")
+    end
+    local handle = io.popen(command .. " 2>/dev/null")
+    if not handle then
+        die("failed to start capture")
+    end
+    local needed = math.floor(duration * RATE) * 2
+    local data = read_exactly(handle, needed)
+    handle:close()
+    if #data < needed then
+        io.stderr:write(string.format("tonic: capture truncated (%d of %d bytes)\n", #data, needed))
+    end
+    return decode_samples(data)
+end
+
+local function read_input_file(path)
+    local handle = io.open(path, "rb")
+    if not handle then
+        die("cannot open input file: " .. path)
+    end
+    local data = handle:read("*a")
+    handle:close()
+    return decode_samples(data)
+end
+
+-- pitch detection --
+
+local function fft(re, im, invert)
+    local n = #re
+    local j = 0
+    for i = 1, n - 2 do
+        local bit = n / 2
+        while j >= bit and bit > 0 do
+            j = j - bit
+            bit = bit / 2
+        end
+        j = j + bit
+        if i < j then
+            re[i + 1], re[j + 1] = re[j + 1], re[i + 1]
+            im[i + 1], im[j + 1] = im[j + 1], im[i + 1]
+        end
+    end
+    local len = 2
+    while len <= n do
+        local angle = 2 * math.pi / len * (invert and 1 or -1)
+        local step_r, step_i = math.cos(angle), math.sin(angle)
+        local half = len / 2
+        for block = 0, n - 1, len do
+            local cur_r, cur_i = 1.0, 0.0
+            for k = 0, half - 1 do
+                local p = block + k + 1
+                local q = p + half
+                local upper_r, upper_i = re[p], im[p]
+                local lower_r = re[q] * cur_r - im[q] * cur_i
+                local lower_i = re[q] * cur_i + im[q] * cur_r
+                re[p], im[p] = upper_r + lower_r, upper_i + lower_i
+                re[q], im[q] = upper_r - lower_r, upper_i - lower_i
+                cur_r, cur_i = cur_r * step_r - cur_i * step_i, cur_r * step_i + cur_i * step_r
+            end
+        end
+        len = len * 2
+    end
+    if invert then
+        for i = 1, n do
+            re[i] = re[i] / n
+            im[i] = im[i] / n
+        end
+    end
+end
+
+local function autocorrelation(frame_samples, length)
+    local size = 1
+    while size < 2 * length do
+        size = size * 2
+    end
+    local re, im = {}, {}
+    for i = 1, size do
+        re[i] = i <= length and frame_samples[i] or 0.0
+        im[i] = 0.0
+    end
+    fft(re, im, false)
+    for i = 1, size do
+        re[i] = re[i] * re[i] + im[i] * im[i]
+        im[i] = 0.0
+    end
+    fft(re, im, true)
+    return re
+end
+
+local function cumulative_mean_normalized_difference(frame_samples, length)
+    local correlation = autocorrelation(frame_samples, length)
+    local prefix = { 0.0 }
+    for i = 1, length do
+        prefix[i + 1] = prefix[i] + frame_samples[i] * frame_samples[i]
+    end
+    local total = prefix[length + 1]
+    local normalized = { 1.0 }
+    local running = 0.0
+    for lag = 1, length - 1 do
+        local difference = prefix[length - lag + 1]
+            + (total - prefix[lag + 1])
+            - 2.0 * correlation[lag + 1]
+        running = running + difference
+        local denominator = running > 1e-12 and running or 1e-12
+        normalized[lag + 1] = difference * lag / denominator
+    end
+    return normalized
+end
+
+local function parabolic_lag(normalized, lag, length)
+    if lag < 1 or lag >= length - 1 then
+        return lag
+    end
+    local prev_value = normalized[lag]
+    local center_value = normalized[lag + 1]
+    local next_value = normalized[lag + 2]
+    local curvature = prev_value - 2.0 * center_value + next_value
+    if curvature == 0 then
+        return lag
+    end
+    return lag + 0.5 * (prev_value - next_value) / curvature
+end
+
+local function yin_f0(frame_samples, length)
+    local mean = 0.0
+    for i = 1, length do
+        mean = mean + frame_samples[i]
+    end
+    mean = mean / length
+    local centered = {}
+    for i = 1, length do
+        centered[i] = frame_samples[i] - mean
+    end
+    local normalized = cumulative_mean_normalized_difference(centered, length)
+    local min_lag = math.max(2, math.floor(RATE / FMAX))
+    local max_lag = math.min(length - 1, math.floor(RATE / FMIN))
+    if max_lag <= min_lag then
+        return 0.0, 1.0
+    end
+    local lag
+    for tau = min_lag, max_lag - 1 do
+        if normalized[tau + 1] < YIN_THRESHOLD then
+            lag = tau
+            while lag + 1 < max_lag and normalized[lag + 2] < normalized[lag + 1] do
+                lag = lag + 1
+            end
+            break
+        end
+    end
+    if not lag then
+        local best_value = math.huge
+        for tau = min_lag, max_lag - 1 do
+            if normalized[tau + 1] < best_value then
+                lag, best_value = tau, normalized[tau + 1]
+            end
+        end
+    end
+    return RATE / parabolic_lag(normalized, lag, length), normalized[lag + 1]
+end
+
+-- note tracking and classification --
+
+local function signal_rms(samples)
+    local count = #samples
+    if count == 0 then
+        return 0.0
+    end
+    local sum = 0.0
+    for i = 1, count do
+        sum = sum + samples[i] * samples[i]
+    end
+    return math.sqrt(sum / count)
+end
+
+local function note_histogram(samples)
+    local count = #samples
+    local mean = 0.0
+    for i = 1, count do
+        mean = mean + samples[i]
+    end
+    mean = count > 0 and mean / count or 0.0
+    local centered = {}
+    for i = 1, count do
+        centered[i] = samples[i] - mean
+    end
+    for i = count + 1, FRAME do
+        centered[i] = 0.0
+    end
+    count = math.max(count, FRAME)
+    local starts, levels = {}, {}
+    local max_level = 0.0
+    for start = 1, count - FRAME + 1, HOP do
+        local sum = 0.0
+        for i = start, start + FRAME - 1 do
+            sum = sum + centered[i] * centered[i]
+        end
+        local level = math.sqrt(sum / FRAME)
+        starts[#starts + 1] = start
+        levels[#levels + 1] = level
+        if level > max_level then
+            max_level = level
+        end
+    end
+    local histogram = {}
+    for i = 1, 12 do
+        histogram[i] = 0
+    end
+    if max_level <= 0 then
+        return histogram
+    end
+    local gate_level = math.max(0.2 * max_level, LEVEL_FLOOR)
+    local frame_samples = {}
+    for index = 1, #starts do
+        if levels[index] >= gate_level then
+            local start = starts[index]
+            for i = 1, FRAME do
+                frame_samples[i] = centered[start + i - 1]
+            end
+            local frequency, aperiodicity = yin_f0(frame_samples, FRAME)
+            if frequency > 0 and aperiodicity <= MAX_APERIODICITY then
+                local midi_note = math.floor(69 + 12 * math.log(frequency / 440.0) / LOG2 + 0.5)
+                local pc = midi_note % 12
+                histogram[pc + 1] = histogram[pc + 1] + 1
+            end
+        end
+    end
+    return histogram
+end
+
+local function build_template(root_pc, intervals)
+    local mask = {}
+    for i = 1, 12 do
+        mask[i] = 0
+    end
+    for _, interval in ipairs(intervals) do
+        mask[(root_pc + interval) % 12 + 1] = 1
+    end
+    return mask
+end
+
+local function classify(profile, minor_template, major_template)
+    local minor_score, major_score = 0.0, 0.0
+    for i = 1, 12 do
+        minor_score = minor_score + profile[i] * minor_template[i] * (1 - major_template[i])
+        major_score = major_score + profile[i] * major_template[i] * (1 - minor_template[i])
+    end
+    local total = minor_score + major_score
+    if total <= 1e-9 then
+        minor_score, major_score = 0.0, 0.0
+        for i = 1, 12 do
+            minor_score = minor_score + profile[i] * minor_template[i]
+            major_score = major_score + profile[i] * major_template[i]
+        end
+        total = minor_score + major_score
+    end
+    if total <= 1e-9 then
+        return "minor", 0.0
+    end
+    if major_score >= minor_score then
+        return "major", major_score / total
+    end
+    return "minor", minor_score / total
+end
+
+local function format_top_notes(profile)
+    local order = {}
+    for i = 1, 12 do
+        order[i] = i
+    end
+    table.sort(order, function(a, b)
+        if profile[a] == profile[b] then
+            return a > b
+        end
+        return profile[a] > profile[b]
+    end)
+    local parts = {}
+    for rank = 1, 5 do
+        local index = order[rank]
+        if profile[index] > 0 then
+            parts[#parts + 1] = string.format("%s(%.0f%%)", PC_TO_NOTE[index], profile[index] * 100)
+        end
+    end
+    return table.concat(parts, ", ")
+end
+
+-- verdict pipeline --
+
+local function emit(stream, text)
+    stream:write(text, "\n")
+    stream:flush()
+end
+
+local function run_decide(opts, stream)
+    local root_pc = NOTE_TO_PC[opts.key]
+    local samples
+    if opts.input then
+        samples = read_input_file(opts.input)
+    else
+        for seconds_left = math.floor(opts.countdown), 1, -1 do
+            emit(stream, string.format("Get ready... %d", seconds_left))
+            os.execute("sleep 1")
+        end
+        emit(
+            stream,
+            string.format(
+                "Listening for %gs in key of %s (%s) -- play now!",
+                opts.duration,
+                opts.key,
+                opts.scale
+            )
+        )
+        samples = capture_audio(opts.duration, opts.source)
+    end
+    local rms = signal_rms(samples)
+    local source_label = opts.input or opts.source or "default"
+    if rms < SILENCE_RMS then
+        emit(stream, "VERDICT: UNCLEAR (almost no signal -- check input/cable/volume)")
+        emit(stream, string.format("  rms=%.5f  source=%s", rms, source_label))
+        return "UNCLEAR", "no signal"
+    end
+    local counts = note_histogram(samples)
+    local voiced_frames, distinct_notes = 0, 0
+    for i = 1, 12 do
+        voiced_frames = voiced_frames + counts[i]
+        if counts[i] > 0 then
+            distinct_notes = distinct_notes + 1
+        end
+    end
+    if voiced_frames < MIN_VOICED_FRAMES or distinct_notes < MIN_DISTINCT_NOTES then
+        emit(stream, "VERDICT: UNCLEAR (not enough distinct notes -- play a fuller lick, louder)")
+        emit(
+            stream,
+            string.format(
+                "  rms=%.5f  voiced_frames=%d  distinct_notes=%d  source=%s",
+                rms,
+                voiced_frames,
+                distinct_notes,
+                source_label
+            )
+        )
+        return "UNCLEAR", "not enough distinct notes"
+    end
+    local profile = {}
+    for i = 1, 12 do
+        profile[i] = counts[i] / voiced_frames
+    end
+    local scale = SCALES[opts.scale]
+    local mode, confidence = classify(
+        profile,
+        build_template(root_pc, scale.minor),
+        build_template(root_pc, scale.major)
+    )
+    if confidence < opts.min_confidence then
+        emit(
+            stream,
+            string.format(
+                "VERDICT: UNCLEAR (confidence %.2f below %.2f)",
+                confidence,
+                opts.min_confidence
+            )
+        )
+        emit(stream, "  notes played most: " .. format_top_notes(profile))
+        return "UNCLEAR", "low confidence"
+    end
+    local verdict = mode == "major" and "YES" or "NO"
+    local answer = mode == "major" and "YES (approve)" or "NO (decline)"
+    local detail = string.format(
+        "%s  [%s %s, key %s, confidence %.2f]",
+        answer,
+        mode,
+        opts.scale,
+        opts.key,
+        confidence
+    )
+    emit(stream, "VERDICT: " .. detail)
+    emit(stream, "  notes played most: " .. format_top_notes(profile))
+    return verdict, detail
+end
+
+-- subcommands --
+
+local function cmd_decide(opts)
+    run_decide(opts, io.stdout)
+    return 0
+end
+
+local function cmd_confirm(opts)
+    local verdict = run_decide(opts, io.stdout)
+    local exit_codes = { YES = 0, NO = 1, UNCLEAR = 2 }
+    return exit_codes[verdict]
+end
+
+local function cmd_hook(opts)
+    io.read("*a")
+    local verdict, detail = run_decide(opts, io.stderr)
+    if verdict == "YES" then
+        print(
+            '{"hookSpecificOutput": {"hookEventName": "PermissionRequest",'
+                .. ' "decision": {"behavior": "allow"}}}'
+        )
+    elseif verdict == "NO" then
+        print(
+            string.format(
+                '{"hookSpecificOutput": {"hookEventName": "PermissionRequest",'
+                    .. ' "decision": {"behavior": "deny",'
+                    .. ' "permissionDecisionReason": "Tonic verdict: %s"}}}',
+                json_escape(detail)
+            )
+        )
+    end
+    return 0
+end
+
+local function list_pulse_sources()
+    local sources = {}
+    for line in shellout("pactl list short sources"):gmatch("[^\n]+") do
+        local name = line:match("^%d+\t([^\t]+)")
+        if name and not name:find("monitor", 1, true) then
+            sources[#sources + 1] = name
+        end
+    end
+    return sources
+end
+
+local function list_coreaudio_sources()
+    local sources = {}
+    local current
+    for line in shellout("system_profiler SPAudioDataType"):gmatch("[^\n]+") do
+        local device = line:match("^%s*([^:]+):%s*$")
+        if device then
+            current = device
+        end
+        local channels = tonumber(line:match("Input Channels:%s*(%d+)"))
+        if current and channels and channels > 0 then
+            sources[#sources + 1] = current
+            current = nil
+        end
+    end
+    return sources
+end
+
+local function list_capture_sources()
+    if binary_exists("pactl") then
+        return list_pulse_sources()
+    end
+    if binary_exists("system_profiler") then
+        return list_coreaudio_sources()
+    end
+    return {}
+end
+
+local function cmd_mic_check(_)
+    local sources = list_capture_sources()
+    if #sources == 0 then
+        print("No capture sources found (the default input device will be used).")
+        return 0
+    end
+    print("Strum continuously now...\n")
+    local best_rms, best_name = -1, nil
+    for _, name in ipairs(sources) do
+        local samples = capture_audio(2.0, name)
+        local rms = signal_rms(samples)
+        local peak = 0.0
+        for i = 1, #samples do
+            peak = math.max(peak, math.abs(samples[i]))
+        end
+        local bar = string.rep("#", math.min(40, math.floor(rms * 800)))
+        print(string.format("rms=%.4f peak=%.3f |%-40s| %s", rms, peak, bar, name))
+        if rms > best_rms then
+            best_rms, best_name = rms, name
+        end
+    end
+    print("\nLoudest source (use this as --source):")
+    print("  " .. best_name)
+    return 0
+end
+
+-- argument parsing and dispatch --
+
+local function parse_options(args)
+    local opts = {
+        key = "A",
+        scale = "blues",
+        duration = 4.0,
+        countdown = 0,
+        source = os.getenv("TONIC_SOURCE"),
+        min_confidence = 0.0,
+        input = nil,
+    }
+    local i = 1
+    while i <= #args do
+        local argument = args[i]
+        if argument == "--key" then
+            i = i + 1
+            opts.key = ((args[i] or ""):match("^%s*(.-)%s*$")):upper()
+        elseif argument == "--scale" then
+            i = i + 1
+            opts.scale = args[i]
+        elseif argument == "--duration" then
+            i = i + 1
+            opts.duration = tonumber(args[i]) or die("--duration needs a number")
+        elseif argument == "--countdown" then
+            i = i + 1
+            opts.countdown = tonumber(args[i]) or die("--countdown needs a number")
+        elseif argument == "--source" then
+            i = i + 1
+            opts.source = args[i]
+        elseif argument == "--min-confidence" then
+            i = i + 1
+            opts.min_confidence = tonumber(args[i]) or die("--min-confidence needs a number")
+        elseif argument == "--input" then
+            i = i + 1
+            opts.input = args[i] or die("--input needs a file")
+        elseif argument == "-h" or argument == "--help" then
+            io.write(USAGE)
+            os.exit(0)
+        else
+            die("unknown option: " .. argument)
+        end
+        i = i + 1
+    end
+    if not NOTE_TO_PC[opts.key] then
+        die("unknown key: " .. tostring(opts.key))
+    end
+    if not SCALES[opts.scale] then
+        die("unknown scale: " .. tostring(opts.scale) .. " (use blues or pentatonic)")
+    end
+    if opts.source == "" then
+        opts.source = nil
+    end
+    return opts
+end
+
+local COMMANDS = {
+    decide = cmd_decide,
+    confirm = cmd_confirm,
+    hook = cmd_hook,
+    ["mic-check"] = cmd_mic_check,
+}
+
+local function main()
+    local name = arg[1]
+    if not name or name == "-h" or name == "--help" then
+        io.write(USAGE)
+        os.exit(name and 0 or 1)
+    end
+    local command = COMMANDS[name]
+    if not command then
+        io.stderr:write("tonic: unknown subcommand: " .. name .. "\n")
+        os.exit(1)
+    end
+    local rest = {}
+    for i = 2, #arg do
+        rest[#rest + 1] = arg[i]
+    end
+    local ok, result = pcall(function()
+        return command(parse_options(rest))
+    end)
+    if ok then
+        os.exit(result)
+    end
+    io.stderr:write(tostring(result) .. "\n")
+    os.exit(name == "hook" and 0 or 1)
+end
+
+main()

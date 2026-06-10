@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      - name: Install luacheck
+        run: luarocks install luacheck
+      - name: Lint
+        run: luacheck tonic spec/
+      - name: Check formatting
+        uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: latest
+          args: --check tonic spec/
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Lua runtimes
+        run: sudo apt-get update && sudo apt-get install -y luajit lua5.4
+      - name: Smoke test (LuaJIT)
+        run: luajit spec/smoke.lua
+      - name: Smoke test (Lua 5.4)
+        run: TONIC_CMD="lua5.4 tonic" lua5.4 spec/smoke.lua
+
+  build:
+    name: Build
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build all targets
+        uses: luanvil/luast@main
+        with:
+          main: tonic
+          output: tonic-bin
+          targets: linux-x86_64 linux-arm64 darwin-x86_64 darwin-arm64
+          lua-version: jit
+      - name: Upload artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: tonic-bin-*
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: release
+      - name: Prepare release files
+        run: |
+          cd release
+          for f in tonic-bin-*; do mv "$f" "${f/tonic-bin-/tonic-}"; done
+          chmod +x tonic-*
+          sha256sum tonic-* > checksums.txt
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
